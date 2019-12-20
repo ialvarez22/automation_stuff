@@ -1,0 +1,471 @@
+#!/usr/bin/perl
+
+use strict;
+
+use Term::ReadKey;
+use POSIX;
+
+###############################################################################
+#
+# Configuration Variables
+#
+###############################################################################
+
+# Directory for log files (include slash at end)
+my $log_directory = “/home/mailadm/logs/”;
+
+# Any messages with envelope sender address listed in this file will be skipped over
+my $skip_file = “/home/mailadm/skip_senders.txt”;
+
+# Location of system binaries
+my $exim = “/usr/sbin/exim”;
+my $less = “/usr/bin/less”;
+my $rm = “/bin/rm”;
+my $cat = “/bin/cat”;
+
+# Debug Modes:
+# ————
+# 0 = Disabled
+# 1 = Show commands then run them
+# 2 = Just show commands, don’t run them
+# 3 = Show commands and wait for ENTER key to preform command
+# WARNING: debug_mode only works on system commands issued by the run_cmd subroutine
+# system commands issued by backticks will still run regardless of the
+# value of $debug_mode
+my $debug_mode = 0;
+
+###############################################################################
+#
+# Global Variables
+#
+###############################################################################
+
+my %message_status = ();
+my %message_senders = ();
+my %message_recipients = ();
+
+my $totalmess;
+
+my %spam_auth_list;
+my %spam_ip_list;
+
+my %skip_list;
+
+###############################################################################
+#
+# Sanity Checks
+#
+###############################################################################
+
+unless( -d $log_directory && -w $log_directory ) {
+die( “Log directory ‘$log_directory’ does not exist or is not writable.\n” );
+}
+
+unless( -x $exim ) {
+die( “Unable to execute exim at ‘$exim’.\n” );
+}
+
+unless( -x $less ) {
+die( “Unable to execute less at ‘$less’.\n” );
+}
+
+unless( -x $rm ) {
+die( “Unable to execute rm at ‘$rm’.\n” );
+}
+
+unless( -x $cat ) {
+die( “Unable to execute cat at ‘$cat’.\n” );
+}
+
+# Read in the skip file
+if( -T $skip_file ) {
+foreach my $line (`$cat $skip_file`) {
+chomp( $line );
+
+# Skip blank lines and lines begining with ‘#’
+next if( $line =~ /^#/ );
+next if( $line =~ /^\s*$/ );
+
+# If the line looks like an email address, add it to %skip_list
+if( $line =~ /^.+\@.+\.\w{2,7}$/ ) {
+$skip_list{$line} = 1;
+print( “* Note: Skipping all mail from ‘$line’.\n” );
+} else {
+print( “** WARNING: Ignoring line in ‘$skip_file’ : $line\n” );
+}
+}
+}
+
+###############################################################################
+#
+# Main body of script starts here
+#
+###############################################################################
+
+&read_queue();
+
+# Run the clean_queue subroutine, and if it returns non-zero re-read the queue
+# and run it again
+while( &clean_queue() ) {
+&read_queue();
+}
+
+# Exit now if there is nothing to write in log files
+exit( 0 ) if( scalar( keys %spam_auth_list ) == 0 && scalar( keys %spam_ip_list ) == 0 );
+
+# Create spam files based on information collected when user pressed ‘s’ key
+my $spam_list_auth = $log_directory . “spam_list_auth-” . strftime( ‘%Y%m%d’, localtime ) . “.txt”;
+my $spam_list_ips = $log_directory . “spam_list_ips-” . strftime( ‘%Y%m%d’, localtime ) . “.txt”;
+
+# Open log files
+open( SPAM_LIST_AUTH, “>>$spam_list_auth” ) or die( “*** ERROR: Cannot append to ‘$spam_list_auth’ : $!\n” );
+open( SPAM_LIST_IPS, “>>$spam_list_ips” ) or die( “*** ERROR: Cannot append to ‘$spam_list_ips’ : $!\n” );
+
+# Print date to log files
+print( SPAM_LIST_AUTH localtime() . “\n” );
+print( SPAM_LIST_IPS localtime() . “\n” );
+
+# Print spammer info to log files
+foreach my $key (keys %spam_auth_list) {
+print( SPAM_LIST_AUTH “$key\t” . $spam_auth_list{$key} . “\n” );
+}
+
+foreach my $key (keys %spam_ip_list) {
+print( SPAM_LIST_IPS “$key\t” . $spam_ip_list{$key} . “\n” );
+}
+
+close( SPAM_LIST_AUTH );
+close( SPAM_LIST_IPS );
+
+###############################################################################
+#
+# run_cmd:
+# Subroutine to run a system command
+#
+###############################################################################
+
+sub run_cmd {
+my ($cmd) = @_;
+my $res;
+
+print( “\t> $cmd\n” ) if( $debug_mode );
+
+return 0 if( $debug_mode == 2 );
+
+if( $debug_mode == 3 ) {
+print( “(Press ENTER to perform command.)” );
+<STDIN>;
+}
+
+if( ($res = system( “$cmd 2>&1” )) >> 8 ) {
+print( “*** ERROR: Command ‘$cmd’ failed with exit status ($res) : $!\n” );
+}
+
+return $res;
+}
+
+###############################################################################
+#
+# read_queue:
+# Subroutine to read the mail queue
+#
+###############################################################################
+
+sub read_queue {
+
+my $message_id;
+my $status;
+
+print( “* Reading queue…\n” );
+
+# Reset variables in case queue is being re-read
+%message_senders = ();
+%message_status = ();
+%message_recipients = ();
+$totalmess = 0;
+
+# Loop through each line of the output of exim -bp
+foreach my $line (`$exim -bp`) {
+chomp( $line );
+
+next if( $line =~ /^\s*$/ );
+
+# Record message details
+if( $line =~ /^\s*[\w\.]+\s+[\w\.]+\s+(\S+)\s+(\S+)\s*(.*)$/ ) {
+$message_id = $1;
+$message_senders{$message_id} = $2;
+$status = $3;
+$message_status{$message_id} = $status !~ /^\s*$/ ? $status : “Normal”;
+$totalmess++;
+}
+
+# Record message recipients
+elsif( $line =~ /^\s+\w*\s+(\S+\@[\w\-\.]+)\s*$/ ) {
+push( @{$message_recipients{$message_id}}, $1 );
+}
+
+# Print a warning message if the output of $exim -bp isn’t understood
+else {
+print( “** WARNING: Line ignored from ‘$exim -bp’ : $line\n” );
+}
+}
+
+print( “\n” );
+}
+
+###############################################################################
+#
+# clean_queue:
+# Subroutine for the actual queue cleaning
+# Displays message data, reads user input, and acts on it
+# Returns 0 if the user wants to quit the program, and 1 if the user wants to
+# re-read the queue
+#
+###############################################################################
+
+sub clean_queue {
+
+my $messnum = 1;
+
+# Loop through each message that read_queue found
+foreach my $mess (keys %message_status) {
+
+# Print out general message info
+my $title = $mess . ” ($messnum/$totalmess)”;
+
+print( “=====[ ” . $title . ” ]” . “=”x(70 – length( $title )) . “\n” );
+
+print( “Status: ” . $message_status{$mess} . “\n” );
+print( “Envelope Sender: ” . $message_senders{$mess} . “\n” );
+
+if( $message_recipients{$mess} ) {
+print( “Envelope Recipients: ” . join( ‘,’ , @{$message_recipients{$mess}} ) . “\n” );
+}
+
+print( “\n” );
+
+# Check to see if this message sender is in the skip_senders file
+my $skip_addr = $message_senders{$mess};
+
+if( $skip_addr =~ /^<(.+)>$/ ) {
+$skip_addr = $1;
+}
+
+if( $skip_list{$skip_addr} ) {
+print( “* Note: Skipping message from ‘$skip_addr’.\n” );
+next;
+}
+
+# Print out some info from the message header
+my @headerlines = `$exim -Mvh $mess`;
+
+my $ip_addr = “”;
+my $auth_addr = “”;
+
+foreach my $line (@headerlines) {
+if( $line =~ /To\: (.+)$/ ) {
+print( “To: $1\n” );
+} elsif( $line =~ /From\: (.+)$/ ) {
+print( “From: $1\n” );
+} elsif( $line =~ /Subject\: (.+)$/ ) {
+print( “Subject: $1\n” );
+} elsif( $line =~ /\-host_address (\d+\.\d+\.\d+\.\d+)/ ) {
+$ip_addr = $1;
+print( “Host address: $ip_addr\n” );
+} elsif( $line =~ /\-auth_id (\S+)\s*$/ ) {
+$auth_addr = $1;
+print( “Authenticated by: $auth_addr\n” );
+}
+}
+
+print( “\n” );
+
+# Get the user input key
+my $key = 0;
+
+while( $key !~ /^[ dqnsr]+$/ ) {
+
+$key = selection( “[SPACE = Next message | H = Show header | B = Show body | D = Delete | S = Mark as Spam | N = Deliver Now | M = Mass Delete | R = Re-read queue | Q = Quit] ” );
+
+# Show header using less
+if( $key eq “h” ) {
+
+my $filename = “/tmp/clean-queue-message-$mess-header.txt”;
+
+run_cmd( “$exim -Mvh $mess > $filename” );
+run_cmd( “$less $filename” );
+run_cmd( “$rm -f $filename” );
+}
+
+# Show body using less
+if( $key eq “b” ) {
+
+my $filename = “/tmp/clean-queue-message-$mess-body.txt”;
+
+run_cmd( “$exim -Mvb $mess > $filename” );
+run_cmd( “$less $filename” );
+run_cmd( “$rm -f $filename” );
+}
+
+# Run the mass_delete subroutine, which returns 1 if any messages were deleted to re-read the queue
+if( $key eq “m” ) {
+if( &mass_delete() ) {
+return 1;
+}
+}
+}
+
+# Mark message as spam and delete it
+if( $key eq “s” ) {
+if( $ip_addr ) {
+$spam_ip_list{$ip_addr}++;
+print( “‘$ip_addr’ added to spam list. Count so far: ” . $spam_ip_list{$ip_addr} . “\n” );
+}
+
+if( $auth_addr ) {
+$spam_auth_list{$auth_addr}++;
+print( “‘$auth_addr’ added to spam list. Count so far: ” . $spam_auth_list{$auth_addr} . “\n” );
+}
+
+if( !$ip_addr && !$auth_addr ) {
+print( “** Warning: Neither IP address nor authentication email address is known, so there is nothing to add to the spam list.\n” );
+}
+
+# Set $key to “d” to delete message
+$key = “d”;
+}
+
+# Attempt to deliver message now
+if( $key eq “n” ) {
+print( “* Attempting to deliver message ‘$mess’\n” );
+run_cmd( “$exim -v -M $mess” );
+}
+
+# Quit
+if( $key eq “q” ) {
+return 0;
+}
+
+# Re-read queue
+if( $key eq “r” ) {
+return 1;
+}
+
+# Delete message
+if( $key eq “d” ) {
+print( “* Deleting Message ‘$mess’\n” );
+run_cmd( “$exim -Mrm $mess” );
+}
+
+print( “\n” );
+
+$messnum++;
+}
+}
+
+###############################################################################
+#
+# mass_delete:
+# Subroutine to mass delete messages
+#
+###############################################################################
+
+sub mass_delete {
+
+my $count = 0;
+my $total;
+my $type;
+my $pattern;
+my $message_id;
+
+# Get user input for what type of message search to do
+while( $type !~ /^[hbc]+$/ ) {
+$type = selection( “[H = Search by headers | B = Search by bodies | C = Cancel] ” );
+}
+
+# Return 0 to go back to clean_queue without re-reading the queue if ‘c’ is pressed
+return 0 if( $type eq “c” );
+
+# Get user input for text string to search for
+print( “Enter text to search for (enter a blank line to cancel): ” );
+chomp( $pattern = <STDIN> );
+
+# Return 0 to go back to clean_queue without re-reading the queue if user enters a blank line
+return 0 if( $pattern eq “” );
+
+# Loop through all messages in queue
+foreach my $line (`$exim -bp`) {
+chomp( $line );
+
+# Get message ID if current line has that info
+if( $line =~ /^\s*[\w\.]+\s+[\w\.]+\s+(\S+)\s+\S+\s*.*$/ ) {
+$message_id = $1;
+$total++;
+
+print( “* Examining message ‘$message_id’.\n” );
+
+# Search for text in either message header or body
+foreach my $text (`$exim -Mv$type $message_id`) {
+
+# If text is found …
+if( $text =~ /$pattern/i ) {
+
+print( “* Message ‘$message_id’ contains ‘$pattern’ … deleting.\n” );
+
+# Attempt to delete message
+if( !run_cmd( “$exim -Mrm $message_id” ) ) {
+$count++;
+} else {
+print( “*** Error deleting message ‘$message_id’.\n” );
+}
+
+last;
+}
+}
+
+# Print a warning message if the output of $exim -bp isn’t understood
+} elsif( $line !~ /^\s+\w*\s+\S+\@[\w\-\.]+\s*$/ && $line !~ /^\s*$/ ) {
+print( “** WARNING: Line ignored from ‘$exim -bp’ : $line\n” );
+}
+
+}
+
+print( “*** Deleted ($count) out of ($total) messages.\n\n” );
+
+# Return 1 to make clean_queue re-read the queue
+return 1;
+}
+
+###############################################################################
+#
+# selection:
+# Subroutine to display a selection prompt and get user input key
+#
+###############################################################################
+
+sub selection {
+my ($prompt) = @_;
+
+my $key;
+
+print( $prompt );
+
+# Wait for user to press a key and record what key is pressed
+ReadMode( “cbreak” );
+
+# Flush out any current buffered keypresses
+while( defined( $key = ReadKey( -1 ))) {}
+
+$key = ReadKey( 0 );
+$key = lc( $key );
+
+ReadMode( “normal” );
+
+# Erase the prompt from the display (\b makes the cursor go backwards but doesn’t actually
+# delete so printing space characters is necessary)
+print( “\b” x length( $prompt ) );
+print( ” ” x length( $prompt ) );
+print( “\b” x length( $prompt ) );
+
+return $key;
+}
